@@ -1,6 +1,6 @@
 // ストレッチタイマー Service Worker
 // CACHE_VERSION を上げると古いキャッシュが破棄され、新しいファイルが配信される
-const CACHE_VERSION = 'stretch-timer-v1';
+const CACHE_VERSION = 'stretch-timer-v2';
 const ASSETS = [
   './',
   './index.html',
