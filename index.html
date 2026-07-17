@@ -111,6 +111,10 @@
       <input type="checkbox" id="loop">
       <label for="loop" style="margin:0;font-size:14px;opacity:1">終わったら最初から繰り返す</label>
     </div>
+    <div class="row">
+      <input type="checkbox" id="secTick">
+      <label for="secTick" style="margin:0;font-size:14px;opacity:1">毎秒音を鳴らす(休憩中は鳴らない)</label>
+    </div>
   </div>
 
   <div class="display">
@@ -131,11 +135,11 @@
   const $ = id => document.getElementById(id);
   const timeEl=$('time'), phaseEl=$('phaseLabel'), subEl=$('sub'), barEl=$('bar');
   const startBtn=$('startBtn'), resetBtn=$('resetBtn');
-  const inputEl=$('intervals'), loopEl=$('loop'), setupEl=$('setup');
+  const inputEl=$('intervals'), loopEl=$('loop'), secTickEl=$('secTick'), setupEl=$('setup');
 
   let audioCtx=null, wakeLock=null;
   let state='idle'; // idle | ready | running | paused | done
-  let plan=[], idx=0, remaining=0, lastTick=0, rafId=null, lastBeepSecond=null;
+  let plan=[], idx=0, remaining=0, lastTick=0, rafId=null, lastBeepSecond=null, lastSecTick=null;
 
   // ---- 設定の保存/復元 ----
   const STORAGE_KEY='stretch-timer-settings';
@@ -145,15 +149,17 @@
       if(!s) return;
       if(typeof s.intervals==='string' && s.intervals.trim()!=='') inputEl.value=s.intervals;
       loopEl.checked=!!s.loop;
+      secTickEl.checked=!!s.secTick;
     }catch(e){}
   }
   function saveSettings(){
     try{
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({intervals:inputEl.value, loop:loopEl.checked}));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({intervals:inputEl.value, loop:loopEl.checked, secTick:secTickEl.checked}));
     }catch(e){}
   }
   inputEl.addEventListener('input',()=>{saveSettings();syncPresetSelection();});
   loopEl.addEventListener('change',()=>{saveSettings();syncPresetSelection();});
+  secTickEl.addEventListener('change',()=>{saveSettings();syncPresetSelection();});
   loadSettings();
 
   // ---- プリセット(名前を付けて保存/選択) ----
@@ -186,7 +192,7 @@
   }
   // 現在の入力がどれかのプリセットと一致していればそれを選択状態にする
   function syncPresetSelection(){
-    const hit=loadPresets().find(p=>p.intervals===inputEl.value && !!p.loop===loopEl.checked);
+    const hit=loadPresets().find(p=>p.intervals===inputEl.value && !!p.loop===loopEl.checked && !!p.secTick===secTickEl.checked);
     presetSel.value=hit?hit.name:'';
     delPresetBtn.disabled=presetSel.value==='';
   }
@@ -197,6 +203,7 @@
     if(!p) return;
     inputEl.value=p.intervals;
     loopEl.checked=!!p.loop;
+    secTickEl.checked=!!p.secTick;
     saveSettings();
   });
 
@@ -208,9 +215,9 @@
     const i=list.findIndex(p=>p.name===name);
     if(i>=0){
       if(!confirm('「'+name+'」を上書きしますか?')) return;
-      list[i]={name, intervals:inputEl.value, loop:loopEl.checked};
+      list[i]={name, intervals:inputEl.value, loop:loopEl.checked, secTick:secTickEl.checked};
     }else{
-      list.push({name, intervals:inputEl.value, loop:loopEl.checked});
+      list.push({name, intervals:inputEl.value, loop:loopEl.checked, secTick:secTickEl.checked});
     }
     savePresets(list);
     renderPresetOptions(name);
@@ -237,6 +244,7 @@
     o.start(); o.stop(audioCtx.currentTime+dur);
   }
   const tickSound=()=>beep(880,0.1,0.35);          // カウントダウン
+  const secSound=()=>beep(660,0.05,0.15);          // 毎秒の小さい音
   const goSound=()=>{beep(1320,0.18,0.5)};          // 区間開始
   const doneSound=()=>{beep(1320,0.15,0.5);setTimeout(()=>beep(1760,0.3,0.5),180)}; // 全部終了
 
@@ -286,7 +294,7 @@
   }
 
   function startPhase(i){
-    idx=i; remaining=plan[i]; lastBeepSecond=null;
+    idx=i; remaining=plan[i]; lastBeepSecond=null; lastSecTick=Math.ceil(plan[i]);
     setBodyPhase(i%2===0?'phase-stretch':'phase-rest');
     goSound();
     render();
@@ -300,6 +308,11 @@
     // 残り3秒でカウントダウン音
     const ceil=Math.ceil(remaining);
     if(ceil<=3 && ceil>=1 && ceil!==lastBeepSecond){ lastBeepSecond=ceil; tickSound(); }
+
+    // 毎秒音(ストレッチ中のみ。休憩中とカウントダウン中は鳴らさない)
+    if(secTickEl.checked && state==='running' && idx%2===0 && ceil>3 && ceil!==lastSecTick){
+      lastSecTick=ceil; secSound();
+    }
 
     if(remaining<=0){
       if(state==='ready'){
