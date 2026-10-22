@@ -137,9 +137,9 @@
   const startBtn=$('startBtn'), resetBtn=$('resetBtn');
   const inputEl=$('intervals'), loopEl=$('loop'), secTickEl=$('secTick'), setupEl=$('setup');
 
-  let audioCtx=null, wakeLock=null;
+  let wakeLock=null;
   let state='idle'; // idle | ready | running | paused | done
-  let plan=[], idx=0, remaining=0, lastTick=0, rafId=null, lastBeepSecond=null, lastSecTick=null;
+  let plan=[], idx=0, remaining=0, rafId=null;
 
   // ---- 設定の保存/復元 ----
   const STORAGE_KEY='stretch-timer-settings';
@@ -234,19 +234,75 @@
   renderPresetOptions('');
   syncPresetSelection();
 
-  function beep(freq, dur=0.12, vol=0.4){
-    if(!audioCtx) return;
-    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
-    o.type='sine'; o.frequency.value=freq;
-    g.gain.setValueAtTime(vol, audioCtx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime+dur);
-    o.connect(g).connect(audioCtx.destination);
-    o.start(); o.stop(audioCtx.currentTime+dur);
+  // ---- 音声 ----
+  // 鳴らす音はすべて開始時に1本のWAVへ書き出し、<audio>で再生する。
+  // メディア再生扱いになるので、他アプリ表示中や画面ロック中でもカウント音が鳴り続ける。
+  // 表示側は audio.currentTime から現在位置を逆算するので、音と表示がズレない。
+  const SR=11025, READY=3;
+  const audio=new Audio(); audio.preload='auto';
+  let introUrl=null, cycleUrl=null, onIntro=true, looping=false, starts=[], total=0, inReady=true;
+
+  const S_TICK=[880,0.1,0.35];   // カウントダウン
+  const S_SEC=[660,0.05,0.15];   // 毎秒の小さい音
+  const S_GO=[1320,0.18,0.5];    // 区間開始
+
+  // サイクル1周分の音 [時刻, 周波数, 長さ, 音量]
+  function cycleEvents(offset){
+    const ev=[], at=(t,s)=>ev.push([offset+t,...s]);
+    plan.forEach((d,i)=>{
+      const s=starts[i], end=s+d;
+      at(s,S_GO);
+      for(const k of [3,2,1]) if(d>k) at(end-k,S_TICK);
+      if(d<=3) at(s,S_TICK);
+      // 毎秒音(ストレッチ中のみ。休憩中とカウントダウン中は鳴らさない)
+      if(secTickEl.checked && i%2===0) for(let n=4;n<Math.ceil(d);n++) at(end-n,S_SEC);
+    });
+    return ev;
   }
-  const tickSound=()=>beep(880,0.1,0.35);          // カウントダウン
-  const secSound=()=>beep(660,0.05,0.15);          // 毎秒の小さい音
-  const goSound=()=>{beep(1320,0.18,0.5)};          // 区間開始
-  const doneSound=()=>{beep(1320,0.15,0.5);setTimeout(()=>beep(1760,0.3,0.5),180)}; // 全部終了
+
+  // 8bitモノラルWAVを生成してBlob URLを返す
+  function renderWav(len, events){
+    let n=Math.ceil(len*SR); if(n%2) n++;
+    const buf=new Float32Array(n);
+    for(const [t,f,dur,vol] of events){
+      const s0=Math.round(t*SR), m=Math.min(Math.round(dur*SR), n-s0);
+      for(let j=0;j<m;j++){
+        buf[s0+j]+=vol*Math.pow(0.001/vol, j/m)*Math.sin(2*Math.PI*f*j/SR);
+      }
+    }
+    const bytes=new Uint8Array(44+n), dv=new DataView(bytes.buffer);
+    const str=(o,s)=>{for(let i=0;i<s.length;i++) bytes[o+i]=s.charCodeAt(i);};
+    str(0,'RIFF'); dv.setUint32(4,36+n,true); str(8,'WAVE');
+    str(12,'fmt '); dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+    dv.setUint32(24,SR,true); dv.setUint32(28,SR,true); dv.setUint16(32,1,true); dv.setUint16(34,8,true);
+    str(36,'data'); dv.setUint32(40,n,true);
+    for(let i=0;i<n;i++) bytes[44+i]=Math.max(0,Math.min(255,Math.round(128+127*buf[i])));
+    return URL.createObjectURL(new Blob([bytes],{type:'audio/wav'}));
+  }
+
+  function buildAudio(){
+    if(introUrl) URL.revokeObjectURL(introUrl);
+    if(cycleUrl) URL.revokeObjectURL(cycleUrl);
+    introUrl=cycleUrl=null;
+    starts=[]; total=0;
+    for(const d of plan){ starts.push(total); total+=d; }
+    // 最初の音源 = 準備カウント3秒 + 1周目(繰り返さない場合は終了音つき)
+    const intro=[[0,...S_TICK],[1,...S_TICK],[2,...S_TICK], ...cycleEvents(READY)];
+    if(!looping) intro.push([READY+total,1320,0.15,0.5],[READY+total+0.18,1760,0.3,0.5]);
+    introUrl=renderWav(READY+total+(looping?0:0.5), intro);
+    // 繰り返す場合は2周目以降用の音源をループ再生する
+    if(looping) cycleUrl=renderWav(total, cycleEvents(0));
+  }
+
+  function setMediaTitle(title){
+    if(!('mediaSession' in navigator)) return;
+    try{
+      navigator.mediaSession.metadata=new MediaMetadata({
+        title, artist:'ストレッチタイマー',
+        artwork:[{src:'./icons/icon-512.png', sizes:'512x512', type:'image/png'}]
+      });
+    }catch(e){}
+  }
 
   function parsePlan(){
     const nums=inputEl.value.replace(/、/g,',').split(',')
@@ -272,8 +328,8 @@
   function releaseWakeLock(){ try{ wakeLock&&wakeLock.release(); wakeLock=null; }catch(e){} }
 
   function render(){
-    if(state==='ready'){
-      phaseEl.textContent='スタートまで';
+    if(state==='ready'||(state==='paused'&&inReady)){
+      phaseEl.textContent='スタートまで'+(state==='paused'?'(一時停止)':'');
       timeEl.textContent=fmt(remaining);
       subEl.textContent='次: '+phaseName(0)+' '+fmt(plan[0]);
       barEl.style.width='0%';
@@ -293,87 +349,110 @@
     }
   }
 
-  function startPhase(i){
-    idx=i; remaining=plan[i]; lastBeepSecond=null; lastSecTick=Math.ceil(plan[i]);
-    setBodyPhase(i%2===0?'phase-stretch':'phase-rest');
-    goSound();
+  function finish(){
+    if(state==='idle'||state==='done') return;
+    state='done'; cancelAnimationFrame(rafId);
+    document.body.classList.remove('running');
+    setBodyPhase(null); releaseWakeLock();
+    startBtn.textContent='もう一度'; setupEl.classList.remove('hidden');
+    setMediaTitle('おつかれさま!');
     render();
   }
 
-  function loop(now){
-    if(state!=='running'&&state!=='ready'){return;}
-    const dt=(now-lastTick)/1000; lastTick=now;
-    remaining-=dt;
-
-    // 残り3秒でカウントダウン音
-    const ceil=Math.ceil(remaining);
-    if(ceil<=3 && ceil>=1 && ceil!==lastBeepSecond){ lastBeepSecond=ceil; tickSound(); }
-
-    // 毎秒音(ストレッチ中のみ。休憩中とカウントダウン中は鳴らさない)
-    if(secTickEl.checked && state==='running' && idx%2===0 && ceil>3 && ceil!==lastSecTick){
-      lastSecTick=ceil; secSound();
-    }
-
-    if(remaining<=0){
-      if(state==='ready'){
-        state='running'; document.body.classList.add('running');
-        startPhase(0);
-      }else if(idx+1<plan.length){
-        startPhase(idx+1);
-      }else if(loopEl.checked){
-        startPhase(0);
-      }else{
-        state='done'; document.body.classList.remove('running');
-        setBodyPhase(null); doneSound(); releaseWakeLock();
-        startBtn.textContent='もう一度'; setupEl.classList.remove('hidden');
-        render(); return;
+  // 再生位置から現在の区間と残り時間を求める(音は音源側で鳴るのでここでは鳴らさない)
+  function sync(){
+    if(state!=='running'&&state!=='ready') return;
+    const t=onIntro ? audio.currentTime-READY : audio.currentTime;
+    if(t<0){
+      inReady=true; state='ready'; remaining=-t;
+    }else{
+      if(!looping && t>=total){ finish(); return; }
+      const tt=Math.min(t,total);
+      let i=plan.length-1;
+      while(i>0 && tt<starts[i]) i--;
+      if(inReady||i!==idx){
+        setBodyPhase(i%2===0?'phase-stretch':'phase-rest');
+        setMediaTitle(phaseName(i)+'('+(i+1)+' / '+plan.length+')');
       }
+      inReady=false; state='running'; idx=i;
+      remaining=Math.max(0,starts[i]+plan[i]-tt);
     }
     render();
-    rafId=requestAnimationFrame(loop);
   }
 
-  startBtn.addEventListener('click',()=>{
-    if(state==='running'){ // 一時停止
-      state='paused'; cancelAnimationFrame(rafId);
-      startBtn.textContent='再開'; render(); return;
-    }
-    if(state==='paused'){ // 再開
-      state='running'; lastTick=performance.now();
-      startBtn.textContent='一時停止'; rafId=requestAnimationFrame(loop); render(); return;
-    }
-    // idle / done → 開始
-    plan=parsePlan();
-    if(plan.length===0){ alert('時間を入力してください(例: 120,10,120,10)'); return; }
-    saveSettings();
-    if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
-    audioCtx.resume();
-    requestWakeLock();
-    setupEl.classList.add('hidden');
-    state='ready'; remaining=3; lastBeepSecond=null;
-    setBodyPhase('phase-ready');
-    document.body.classList.add('running');
-    startBtn.textContent='一時停止';
-    tickSound();
-    lastTick=performance.now();
-    render();
-    rafId=requestAnimationFrame(loop);
-  });
+  function loop(){
+    sync();
+    if(state==='running'||state==='ready') rafId=requestAnimationFrame(loop);
+  }
 
-  resetBtn.addEventListener('click',()=>{
-    cancelAnimationFrame(rafId); releaseWakeLock();
+  // バックグラウンドでは requestAnimationFrame が止まるので timeupdate でも位置を追う(ロック画面の表示用)
+  audio.addEventListener('timeupdate',sync);
+  audio.addEventListener('ended',()=>{
+    if(state==='idle'||state==='done') return;
+    if(looping && onIntro){
+      onIntro=false; audio.src=cycleUrl; audio.loop=true;
+      audio.play().catch(()=>{});
+    }else{
+      finish();
+    }
+  });
+  // 一時停止/再開はロック画面や着信などで外から起きることもあるので、audio のイベントで状態を合わせる
+  audio.addEventListener('pause',()=>{
+    if(audio.ended || (state!=='running'&&state!=='ready')) return;
+    state='paused'; cancelAnimationFrame(rafId);
+    startBtn.textContent='再開'; render();
+  });
+  audio.addEventListener('play',()=>{
+    if(state!=='paused') return;
+    state=inReady?'ready':'running'; requestWakeLock();
+    startBtn.textContent='一時停止';
+    cancelAnimationFrame(rafId); rafId=requestAnimationFrame(loop);
+  });
+  if('mediaSession' in navigator){
+    try{
+      navigator.mediaSession.setActionHandler('play',()=>{ if(state==='paused') audio.play().catch(()=>{}); });
+      navigator.mediaSession.setActionHandler('pause',()=>{ if(state==='running'||state==='ready') audio.pause(); });
+    }catch(e){}
+  }
+
+  function reset(){
     state='idle'; idx=0;
+    cancelAnimationFrame(rafId); audio.pause(); releaseWakeLock();
     document.body.classList.remove('running'); setBodyPhase(null);
     setupEl.classList.remove('hidden');
     startBtn.textContent='スタート';
     phaseEl.textContent='準備OK?'; timeEl.textContent='--'; subEl.textContent='';
     barEl.style.width='0%';
+  }
+
+  startBtn.addEventListener('click',()=>{
+    if(state==='running'||state==='ready'){ audio.pause(); return; } // 一時停止
+    if(state==='paused'){ audio.play().catch(()=>{}); return; }      // 再開
+    // idle / done → 開始
+    plan=parsePlan();
+    if(plan.length===0){ alert('時間を入力してください(例: 120,10,120,10)'); return; }
+    saveSettings();
+    looping=loopEl.checked;
+    buildAudio();
+    // 再生はユーザー操作(このクリック)の中で開始する必要がある
+    onIntro=true; audio.loop=false; audio.src=introUrl;
+    audio.play().catch(()=>{ reset(); alert('音声を再生できませんでした'); });
+    requestWakeLock();
+    setupEl.classList.add('hidden');
+    state='ready'; idx=0; inReady=true; remaining=READY;
+    setBodyPhase('phase-ready');
+    document.body.classList.add('running');
+    startBtn.textContent='一時停止';
+    setMediaTitle('スタートまで');
+    render();
+    cancelAnimationFrame(rafId); rafId=requestAnimationFrame(loop);
   });
 
+  resetBtn.addEventListener('click',reset);
+
   document.addEventListener('visibilitychange',()=>{
-    if(document.visibilityState==='visible'&&(state==='running'||state==='ready')){
-      lastTick=performance.now(); // バックグラウンド復帰時のズレ補正
-    }
+    // 画面スリープ防止はバックグラウンドで解除されるので、戻ってきたら取り直す
+    if(document.visibilityState==='visible'&&(state==='running'||state==='ready')) requestWakeLock();
   });
 
   // ---- PWA: Service Worker 登録 ----
