@@ -388,13 +388,15 @@
   // バックグラウンドでは requestAnimationFrame が止まるので timeupdate でも位置を追う(ロック画面の表示用)
   audio.addEventListener('timeupdate',sync);
   audio.addEventListener('ended',()=>{
-    if(state==='idle'||state==='done') return;
-    if(looping && onIntro){
-      onIntro=false; audio.src=cycleUrl; audio.loop=true;
-      audio.play().catch(()=>{});
-    }else{
+    if(state==='running'||state==='ready'){
+      if(looping && onIntro){
+        onIntro=false; audio.src=cycleUrl; audio.loop=true;
+        audio.play().catch(()=>{});
+        return;
+      }
       finish();
     }
+    if(state==='done') stopAudio(); // 終了音を鳴らし終えたら通知/ロック画面の表示も消す
   });
   // 一時停止/再開はロック画面や着信などで外から起きることもあるので、audio のイベントで状態を合わせる
   audio.addEventListener('pause',()=>{
@@ -415,9 +417,18 @@
     }catch(e){}
   }
 
+  // 音源を外してメディアセッションも解除する(pause だけだと通知やロック画面にプレーヤーが残る)
+  function stopAudio(){
+    audio.pause(); audio.loop=false;
+    audio.removeAttribute('src'); audio.load();
+    if('mediaSession' in navigator){
+      try{ navigator.mediaSession.metadata=null; navigator.mediaSession.playbackState='none'; }catch(e){}
+    }
+  }
+
   function reset(){
     state='idle'; idx=0;
-    cancelAnimationFrame(rafId); audio.pause(); releaseWakeLock();
+    cancelAnimationFrame(rafId); stopAudio(); releaseWakeLock();
     document.body.classList.remove('running'); setBodyPhase(null);
     setupEl.classList.remove('hidden');
     startBtn.textContent='スタート';
